@@ -170,12 +170,30 @@ async function deleteRule(materialCode) {
  * 获取所有不重复的会计期间
  */
 async function getPeriods() {
-    const { data, error } = await supabaseClient
-        .from('inventory')
-        .select('period')
-        .order('period', { ascending: false });
+    const periods = new Set();
+    const pageSize = 1000;
+    let offset = 0;
 
-    if (error) return [];
-    const unique = [...new Set((data || []).map(d => d.period))];
-    return unique;
+    // 明细接口有单次行数上限，必须取完再去重，否则月份会被截掉。
+    while (true) {
+        const { data, error, count } = await supabaseClient
+            .from('inventory')
+            .select('period', { count: 'exact' })
+            .order('period', { ascending: false })
+            .order('material_code', { ascending: true })
+            .range(offset, offset + pageSize - 1);
+
+        if (error) throw error;
+        if (!Array.isArray(data)) throw new Error('月份查询未返回有效数据');
+        data.forEach(row => periods.add(row.period));
+        offset += data.length;
+        if (data.length === 0 || (count !== null && count !== undefined && offset >= count)) break;
+    }
+
+    // 保留原始期间文本用于查询，只按数值年月排序。
+    return [...periods].sort((a, b) => {
+        const [yearA, monthA] = a.split('.').map(Number);
+        const [yearB, monthB] = b.split('.').map(Number);
+        return yearB - yearA || monthB - monthA || b.localeCompare(a);
+    });
 }

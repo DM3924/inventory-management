@@ -9,6 +9,13 @@ let rulesCache = [];
 let reportCache = null;
 let diankvFilterMode = 'all'; // 'all' | 'empty' | 'done'
 let currentEditItem = null;
+let periodLoadRequest = 0;
+let periodRevision = 0;
+const inventoryVersions = new Map();
+
+function noteInventoryWrite(period) {
+    inventoryVersions.set(period, (inventoryVersions.get(period) || 0) + 1);
+}
 const collapsedMobileGroups = new Set(); // 记录手机端已折叠的分组名
 
 // ---- 初始化 ----
@@ -159,7 +166,6 @@ async function handleFileUpload(file) {
         const result = await upsertInventory(items, isSecondUpload);
 
         if (result.success) {
-            currentPeriod = period;
             resultDiv.innerHTML = `
                 <div class="alert alert-success">
                     ✅ 上传成功！期间：${period}，共 ${items.length} 条物料
@@ -168,11 +174,8 @@ async function handleFileUpload(file) {
             `;
 
             // 更新期间选择器
-            await loadPeriods();
-            // 显示概览
-            await refreshOverview();
-
-            showToast('上传成功！', 'success');
+            const periodsLoaded = await loadPeriods(period);
+            if (periodsLoaded) showToast('上传成功！', 'success');
         } else {
             resultDiv.innerHTML = `
                 <div class="alert alert-danger">
@@ -190,36 +193,85 @@ async function handleFileUpload(file) {
 }
 
 // ---- 加载期间列表 ----
-async function loadPeriods() {
-    const periods = await getPeriods();
+function selectCurrentPeriod(period, force = false) {
+    if (period === currentPeriod && !force) return;
+    ++periodRevision;
+    currentPeriod = period;
+    inventoryCache = [];
+    reportCache = null;
+    closeModal();
+    renderDiankvList([]);
+    document.getElementById('diankvProgress').textContent = '已录入 0 / 0';
+    document.getElementById('diankvProgressFill').style.width = '0%';
+    document.getElementById('overviewCard').style.display = 'none';
+    document.getElementById('reportResult').innerHTML = '';
+    ['reportSummary', 'inquiryCard', 'noRuleCard', 'rukkuCard', 'liaoliaoCard'].forEach(id => {
+        document.getElementById(id).style.display = 'none';
+    });
+}
+
+async function loadPeriods(preferredPeriod = currentPeriod) {
+    const request = ++periodLoadRequest;
+    let periods;
+    try {
+        periods = await getPeriods();
+    } catch (err) {
+        if (request !== periodLoadRequest) return false;
+        console.error('获取月份列表失败:', err);
+        showToast('月份列表刷新失败，请重试；已上传的数据无需重复上传', 'error');
+        return false;
+    }
+    if (request !== periodLoadRequest) return false;
     const select = document.getElementById('periodSelect');
     const info = document.getElementById('periodInfo');
 
     if (periods.length === 0) {
+        selectCurrentPeriod('', true);
+        inventoryCache = [];
+        reportCache = null;
         select.innerHTML = '<option value="">请先上传 Excel</option>';
         info.textContent = '';
-        return;
+        document.getElementById('overviewCard').style.display = 'none';
+        renderDiankvList([]);
+        return true;
     }
 
+    selectCurrentPeriod(periods.includes(preferredPeriod) ? preferredPeriod : periods[0], true);
     select.innerHTML = periods.map(p => `<option value="${p}" ${p === currentPeriod ? 'selected' : ''}>${p}</option>`).join('');
+    select.value = currentPeriod;
+    reportCache = null;
 
-    if (!currentPeriod) {
-        currentPeriod = periods[0];
-    }
-
-    select.addEventListener('change', async (e) => {
-        currentPeriod = e.target.value;
+    // 反复上传/刷新只保留一个处理器，避免重复请求和旧月份缓存。
+    select.onchange = async (e) => {
+        ++periodLoadRequest;
+        const period = e.target.value;
+        selectCurrentPeriod(period);
+        reportCache = null;
         await refreshOverview();
-    });
+        if (period !== currentPeriod) return;
+        if (document.getElementById('page-diankv').classList.contains('active')) {
+            renderDiankvList(inventoryCache);
+        }
+    };
 
     info.textContent = `共 ${periods.length} 个期间`;
+    await refreshOverview();
+    if (request !== periodLoadRequest) return false;
+    if (document.getElementById('page-diankv').classList.contains('active')) {
+        renderDiankvList(inventoryCache);
+    }
+    return true;
 }
 
 // ---- 刷新概览 ----
 async function refreshOverview() {
     if (!currentPeriod) return;
 
-    const data = await getInventory(currentPeriod);
+    const period = currentPeriod;
+    const revision = periodRevision;
+    const writeVersion = inventoryVersions.get(period) || 0;
+    const data = await getInventory(period);
+    if (revision !== periodRevision || writeVersion !== (inventoryVersions.get(period) || 0)) return;
     inventoryCache = data;
 
     const total = data.length;
@@ -278,7 +330,11 @@ const GROUP_ORDER = ['调料', '干料', '咸菜', '库存商品', '其他'];
 async function loadDiankvList() {
     if (!currentPeriod) return;
 
-    const data = await getInventory(currentPeriod);
+    const period = currentPeriod;
+    const revision = periodRevision;
+    const writeVersion = inventoryVersions.get(period) || 0;
+    const data = await getInventory(period);
+    if (revision !== periodRevision || writeVersion !== (inventoryVersions.get(period) || 0)) return;
     inventoryCache = data;
     renderDiankvList(data);
 }
@@ -287,6 +343,7 @@ function renderDiankvList(data) {
     const container = document.getElementById('materialList');
 
     if (!data || data.length === 0) {
+        renderDiankvTable([]);
         container.innerHTML = `
             <div class="empty-state">
                 <div class="empty-icon">📦</div>
@@ -477,6 +534,9 @@ function startInlineEdit(cell) {
     const code = cell.dataset.code;
     const jiecun = parseFloat(cell.dataset.jiecun) || 0;
     const item = inventoryCache.find(i => i.material_code === code);
+    if (!item || item.period !== currentPeriod) return;
+    const editPeriod = item.period;
+    const editRevision = periodRevision;
     const currentVal = (item && item.diankv !== null && item.diankv !== undefined) ? item.diankv : '';
 
     const input = document.createElement('input');
@@ -523,7 +583,13 @@ function startInlineEdit(cell) {
             }
         }
 
-        const success = await updateDiankv(currentPeriod, code, diankvValue);
+        if (editRevision !== periodRevision) return;
+        const success = await updateDiankv(editPeriod, code, diankvValue);
+        if (success) noteInventoryWrite(editPeriod);
+        if (editRevision !== periodRevision) {
+            if (success && editPeriod === currentPeriod) await loadDiankvList();
+            return;
+        }
         if (success) {
             const idx = inventoryCache.findIndex(i => i.material_code === code);
             if (idx !== -1) inventoryCache[idx].diankv = diankvValue;
@@ -610,6 +676,7 @@ function toggleGroup(header) {
 async function clearAllDiankv() {
     if (!currentPeriod || !inventoryCache || inventoryCache.length === 0) return;
     if (!confirm('确定清空本期所有点库记录？')) return;
+    const period = currentPeriod;
     // 分批处理，每批50条，避免URL过长
     const codes = inventoryCache.map(i => i.material_code);
     const batchSize = 50;
@@ -618,10 +685,19 @@ async function clearAllDiankv() {
         const { error } = await supabaseClient
             .from('inventory')
             .update({ diankv: null, updated_at: new Date().toISOString() })
-            .eq('period', currentPeriod)
+            .eq('period', period)
             .in('material_code', batch);
-        if (error) { showToast('清空失败，请重试', 'error'); return; }
+        if (error) {
+            if (period === currentPeriod) {
+                selectCurrentPeriod(period, true);
+                await loadDiankvList();
+            }
+            showToast('清空未全部完成，部分记录可能已清空，请核对后重试', 'error');
+            return;
+        }
+        noteInventoryWrite(period);
     }
+    if (period === currentPeriod) selectCurrentPeriod(period, true);
     showToast('已清空本期所有点库记录', 'success');
     await loadDiankvList();
 }
@@ -647,7 +723,7 @@ function toggleDiankvFilter() {
 // ---- 点库弹窗 ----
 function openDiankvModal(materialCode) {
     const item = inventoryCache.find(i => i.material_code === materialCode);
-    if (!item) return;
+    if (!item || item.period !== currentPeriod) return;
 
     currentEditItem = item;
 
@@ -698,6 +774,15 @@ function closeModal() {
 
 async function saveDiankv() {
     if (!currentEditItem) return;
+    const editItem = currentEditItem;
+    const revision = periodRevision;
+    const period = editItem.period;
+    const code = editItem.material_code;
+    if (period !== currentPeriod) {
+        closeModal();
+        showToast('月份已切换，请重新选择物料', 'error');
+        return;
+    }
 
     const input = document.getElementById('modalDiankvInput');
     const val = input.value.trim();
@@ -712,11 +797,15 @@ async function saveDiankv() {
         }
     }
 
-    const success = await updateDiankv(currentPeriod, currentEditItem.material_code, diankvValue);
+    const success = await updateDiankv(period, code, diankvValue);
+    if (success) noteInventoryWrite(period);
+    if (revision !== periodRevision || currentEditItem !== editItem) {
+        if (success && period === currentPeriod) await loadDiankvList();
+        return;
+    }
 
     if (success) {
         // 更新缓存
-        const code = currentEditItem.material_code;
         const idx = inventoryCache.findIndex(i => i.material_code === code);
         if (idx !== -1) {
             inventoryCache[idx].diankv = diankvValue;
@@ -1070,7 +1159,11 @@ async function generateReports() {
     }
 
     // 获取最新数据
-    const data = await getInventory(currentPeriod);
+    const period = currentPeriod;
+    const revision = periodRevision;
+    const writeVersion = inventoryVersions.get(period) || 0;
+    const data = await getInventory(period);
+    if (revision !== periodRevision || writeVersion !== (inventoryVersions.get(period) || 0)) return;
     inventoryCache = data;
 
     if (data.length === 0) {
@@ -1080,6 +1173,7 @@ async function generateReports() {
 
     // 获取规则
     const rules = await getRules();
+    if (revision !== periodRevision || writeVersion !== (inventoryVersions.get(period) || 0)) return;
 
     // 运行规则引擎
     const result = processInventory(data, rules);
